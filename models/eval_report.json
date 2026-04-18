@@ -1,0 +1,118 @@
+{
+  "test_accuracy": 0.798,
+  "cv_accuracy_mean": 0.7971,
+  "cv_accuracy_std": 0.0106,
+  "silhouette_score": -0.1931,
+  "n_train": 8176,
+  "n_test": 2045,
+  "n_components": 76,
+  "classes": [
+    "ai_researcher",
+    "cv_engineer",
+    "data_analyst",
+    "data_engineer",
+    "data_scientist",
+    "ml_engineer",
+    "mlops_engineer",
+    "nlp_engineer"
+  ],
+  "confusion_matrix": [
+    [
+      20,
+      0,
+      1,
+      1,
+      5,
+      1,
+      1,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      218,
+      14,
+      58,
+      0,
+      0,
+      0
+    ],
+    [
+      1,
+      1,
+      27,
+      330,
+      48,
+      3,
+      3,
+      0
+    ],
+    [
+      4,
+      1,
+      87,
+      74,
+      849,
+      22,
+      5,
+      0
+    ],
+    [
+      6,
+      2,
+      2,
+      10,
+      16,
+      80,
+      2,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      6,
+      3,
+      5,
+      135,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      0
+    ]
+  ],
+  "confusion_matrix_labels": [
+    "ai_researcher",
+    "cv_engineer",
+    "data_analyst",
+    "data_engineer",
+    "data_scientist",
+    "ml_engineer",
+    "mlops_engineer",
+    "nlp_engineer"
+  ],
+  "cv_scores_per_fold": [
+    0.7934,
+    0.7976,
+    0.7969,
+    0.8153,
+    0.7823
+  ]
+}

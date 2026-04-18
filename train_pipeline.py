@@ -286,7 +286,8 @@ def phase4_evaluate(Z_train, Z_test, train_profiles, test_profiles,
 # ─────────────────────────────────────────────────────────────────
 def save_artifacts(pca, scaler, vectorizer, skill_names,
                    Z_train, skill_vectors, records,
-                   n_comp, recon_mse, recon_var, eval_report):
+                   n_comp, recon_mse, recon_var, eval_report,
+                   train_profiles=None):
     print(f"\n💾  Saving artefacts to {MODELS_DIR}/ …")
     os.makedirs(MODELS_DIR, exist_ok=True)
 
@@ -296,6 +297,16 @@ def save_artifacts(pca, scaler, vectorizer, skill_names,
     joblib.dump(list(skill_names), f"{MODELS_DIR}/skill_names.pkl")
     joblib.dump(Z_train,           f"{MODELS_DIR}/cv_vectors.pkl")
     joblib.dump(skill_vectors,     f"{MODELS_DIR}/skills_vectors.pkl")
+
+    # ── Profile centroids (for Service 4 — profile recommendation) ──
+    if train_profiles is not None:
+        profile_centroids = {}
+        train_profiles_arr = list(train_profiles)
+        for profile in set(train_profiles_arr):
+            mask = [i for i, p in enumerate(train_profiles_arr) if p == profile]
+            profile_centroids[profile] = Z_train[mask].mean(axis=0).tolist()
+        joblib.dump(profile_centroids, f"{MODELS_DIR}/profile_centroids.pkl")
+        joblib.dump(train_profiles_arr, f"{MODELS_DIR}/profile_labels.pkl")
 
     # Build cumvar for meta
     cumvar = np.cumsum(pca.explained_variance_ratio_)
@@ -328,6 +339,8 @@ def save_artifacts(pca, scaler, vectorizer, skill_names,
     print("   ✅  skill_names.pkl")
     print("   ✅  cv_vectors.pkl  (train set)")
     print("   ✅  skills_vectors.pkl")
+    print("   ✅  profile_centroids.pkl  (Service 4)")
+    print("   ✅  profile_labels.pkl     (Service 4)")
     print("   ✅  meta.json")
     print("   ✅  eval_report.json")
 
@@ -361,7 +374,8 @@ def main():
     save_artifacts(
         pca, scaler, vectorizer, skill_names,
         Z_train, skill_vectors, records,
-        n_comp, recon_mse, recon_var, eval_report
+        n_comp, recon_mse, recon_var, eval_report,
+        train_profiles=train_profiles,
     )
 
     print(f"""

@@ -48,15 +48,32 @@ class SkillAnalyzer:
         with open(models_dir / "meta.json") as f:
             self.meta = json.load(f)
 
+        # Profile centroids (Service 4 — profile recommendation)
+        centroids_path = models_dir / "profile_centroids.pkl"
+        self.profile_centroids: dict = (
+            joblib.load(centroids_path) if centroids_path.exists() else {}
+        )
+
         # KNN index on skill vectors (used by upskilling)
         self._knn = NearestNeighbors(n_neighbors=15, metric="cosine")
         self._knn.fit(self.skill_vectors)
+
+        # KNN index on profile centroids (used by profile_recommendation)
+        if self.profile_centroids:
+            self._profile_names  = list(self.profile_centroids.keys())
+            self._centroid_matrix = np.array(
+                [self.profile_centroids[p] for p in self._profile_names]
+            )
+        else:
+            self._profile_names   = []
+            self._centroid_matrix = np.empty((0, 0))
 
         # Skill name → index lookup
         self._skill_idx = {s: i for i, s in enumerate(self.skill_names)}
 
         print(f"✅  Model loaded — {len(self.skill_names)} skills, "
-              f"{self.pca.n_components_} components")
+              f"{self.pca.n_components_} components, "
+              f"{len(self._profile_names)} profiles")
 
     # ─────────────────────────────────────────────────────────────
     # INTERNAL HELPERS
@@ -100,18 +117,43 @@ class SkillAnalyzer:
     # SERVICE 1 — SKILL IMPORTANCE
     # ─────────────────────────────────────────────────────────────
 
-    def skill_importance(self, top_n: int = 10) -> dict:
+    def skill_importance(
+        self,
+        skills: list[str] | None = None,
+        top_n: int = 10,
+    ) -> dict:
         """
-        Return the most discriminating skills overall.
-        Ranked by L2 norm in latent space: high norm = this skill separates
-        different job profiles the most.
+        Return the most discriminating skills, ranked by L2 norm in latent space.
+
+        Parameters
+        ----------
+        skills : list[str] | None
+            If provided, rank only these specific skills (after normalisation).
+            If None, return the global top_n most important skills.
+        top_n : int
+            How many skills to return when `skills` is None (default: 10).
+
+        Returns
+        -------
+        {
+          "ranked_skills": [{"skill": str, "importance_score": float}, ...],
+          "top_skills_per_component": {...}
+        }
         """
-        norms   = np.linalg.norm(self.skill_vectors, axis=1)
-        top_idx = np.argsort(norms)[::-1][:top_n]
+        norms = np.linalg.norm(self.skill_vectors, axis=1)
+
+        if skills is not None:
+            # Rank only the requested skills
+            skills_norm = normalize_skill_list(skills, fuzzy=True)
+            indices = [self._skill_idx[s] for s in skills_norm if s in self._skill_idx]
+            # Sort by norm descending
+            indices = sorted(indices, key=lambda i: norms[i], reverse=True)
+        else:
+            indices = list(np.argsort(norms)[::-1][:top_n])
 
         ranked = [
             {"skill": self.skill_names[i], "importance_score": round(float(norms[i]), 4)}
-            for i in top_idx
+            for i in indices
         ]
         return {
             "ranked_skills": ranked,
@@ -225,21 +267,220 @@ class SkillAnalyzer:
         }
 
     # ─────────────────────────────────────────────────────────────
+    # SERVICE 3b — FREE SKILL EXPLORATION (no profile bias)
+    # ─────────────────────────────────────────────────────────────
+
+    def explore_skills(
+        self,
+        candidate_skills: list[str],
+        top_n: int = 8,
+        neighbors_per_skill: int = 10,
+    ) -> dict:
+        """
+        Explore skills related to what the candidate already knows,
+        WITHOUT any job-title or career-path bias.
+
+        Difference vs upskilling()
+        --------------------------
+        upskilling()    → centroid of all candidate skills → single direction
+                           → naturally gravitates towards a dominant profile
+        explore_skills() → per-skill neighbourhood union  → all directions
+                           → works even with mixed/unusual skill sets
+                           → no assumption about target career
+
+        Algorithm
+        ---------
+        1. For each of the candidate's skills, find its K nearest neighbours
+           in the latent space independently.
+        2. Pool every neighbour found across ALL base skills.
+        3. Score each neighbour by:
+             score = avg_similarity × (1 + 0.4 × (n_sources − 1))
+           The breadth bonus rewards skills that are close to MULTIPLE
+           of the candidate's skills — they are the most universally
+           connected additions.
+        4. Return top_n, sorted by score descending.
+
+        The "related_to" field explains WHY each skill was recommended
+        (which of the candidate's skills it is adjacent to).
+
+        Parameters
+        ----------
+        candidate_skills    : list of skill strings (raw or normalised)
+        top_n               : how many recommendations to return
+        neighbors_per_skill : how many neighbours to fetch per base skill
+
+        Returns
+        -------
+        {
+          "candidate_skills": [...],
+          "mode": "free_exploration",
+          "recommended_skills": [
+            {
+              "skill": str,
+              "score": float,           ← combined relevance score
+              "avg_similarity": float,  ← mean cosine sim across sources
+              "n_sources": int,         ← how many of your skills it's near
+              "related_to": [str, ...]  ← which of your skills triggered it
+            },
+            ...
+          ]
+        }
+        """
+        skills_norm = normalize_skill_list(candidate_skills, fuzzy=True)
+        known = [s for s in skills_norm if s in self._skill_idx]
+
+        if not known:
+            return {"error": "No recognised skills found in the vocabulary."}
+
+        # Per-skill KNN (slightly larger than the shared self._knn)
+        k = neighbors_per_skill + 1   # +1 because the skill itself may appear
+        local_knn = NearestNeighbors(n_neighbors=k, metric="cosine")
+        local_knn.fit(self.skill_vectors)
+
+        # Collect: neighbour → list of (similarity, source_skill)
+        neighbour_hits: dict[str, list[tuple[float, str]]] = {}
+
+        for base in known:
+            vec = self.skill_vectors[self._skill_idx[base]].reshape(1, -1)
+            dists, idxs = local_knn.kneighbors(vec)
+
+            for dist, idx in zip(dists[0], idxs[0]):
+                neighbour = self.skill_names[idx]
+                if neighbour in known:          # already known — skip
+                    continue
+                similarity = float(max(0.0, 1.0 - dist))
+                if neighbour not in neighbour_hits:
+                    neighbour_hits[neighbour] = []
+                neighbour_hits[neighbour].append((similarity, base))
+
+        # Score and rank
+        ranked: list[dict] = []
+        for skill, hits in neighbour_hits.items():
+            avg_sim   = sum(s for s, _ in hits) / len(hits)
+            n_sources = len(hits)
+            # Breadth bonus: skills connected to many of your skills score higher
+            score = avg_sim * (1.0 + 0.4 * (n_sources - 1))
+            related_to = sorted(set(b for _, b in hits))
+            ranked.append({
+                "skill":          skill,
+                "score":          round(score, 4),
+                "avg_similarity": round(avg_sim, 4),
+                "n_sources":      n_sources,
+                "related_to":     related_to,
+            })
+
+        ranked.sort(key=lambda x: -x["score"])
+
+        return {
+            "candidate_skills":    known,
+            "mode":                "free_exploration",
+            "recommended_skills":  ranked[:top_n],
+        }
+
+    # ─────────────────────────────────────────────────────────────
+    # SERVICE 4 — PROFILE RECOMMENDATION
+    # ─────────────────────────────────────────────────────────────
+
+    def profile_recommendation(
+        self,
+        candidate_skills: list[str],
+        top_n: int = 3,
+    ) -> dict:
+        """
+        Given a candidate's skills, predict which job profile(s) they best fit.
+
+        Algorithm:
+          1. Project the candidate's skills into the PCA latent space
+             (via TF-IDF → StandardScaler → PCA).
+          2. Compute cosine similarity between the candidate's vector and
+             the centroid of each profile cluster in the training data.
+          3. Return the top_n most similar profiles with confidence scores.
+
+        Why cosine similarity to centroids?
+          Each profile centroid is the "average data professional" of that type.
+          The closer the candidate is to a centroid, the more their skill mix
+          resembles that profile — regardless of scale (number of skills).
+
+        Returns
+        -------
+        {
+          "candidate_skills": [...],       ← recognised canonical skills
+          "recommended_profiles": [
+            {
+              "rank": 1,
+              "profile": "data_scientist",
+              "label": "Data Scientist",
+              "confidence": 0.87,          ← cosine sim, clamped [0, 1]
+              "description": "..."
+            },
+            ...
+          ]
+        }
+        """
+        _PROFILE_DESCRIPTIONS = {
+            "data_scientist":  "Analyse, modélisation et Machine Learning sur des données structurées.",
+            "data_engineer":   "Construction et maintenance de pipelines de données (ETL, Spark, Airflow).",
+            "ml_engineer":     "Développement et déploiement de modèles ML en production.",
+            "data_analyst":    "Visualisation, reporting et exploration de données (SQL, BI tools).",
+            "mlops_engineer":  "CI/CD pour le ML : Docker, Kubernetes, monitoring de modèles.",
+            "nlp_engineer":    "Traitement du langage naturel : BERT, transformers, spaCy.",
+            "cv_engineer":     "Vision par ordinateur : YOLO, OpenCV, traitement d'images.",
+            "ai_researcher":   "Recherche fondamentale en IA : mathématiques, publications, nouveaux modèles.",
+        }
+
+        if not self.profile_centroids:
+            return {"error": "Profile centroids not available. Re-run train_pipeline.py."}
+
+        # Encode candidate
+        skills_norm = normalize_skill_list(candidate_skills, fuzzy=True)
+        recognised  = [s for s in skills_norm if s in self._skill_idx]
+
+        candidate_vec = self._encode_candidate(candidate_skills).reshape(1, -1)
+
+        # Cosine similarity vs every profile centroid
+        sims = cosine_similarity(candidate_vec, self._centroid_matrix)[0]
+
+        # Rank
+        ranked_idx = np.argsort(sims)[::-1][:top_n]
+
+        recommended = []
+        for rank, idx in enumerate(ranked_idx, 1):
+            profile = self._profile_names[idx]
+            score   = float(sims[idx])
+            recommended.append({
+                "rank":        rank,
+                "profile":     profile,
+                "label":       profile.replace("_", " ").title(),
+                "confidence":  round(max(0.0, score), 4),
+                "description": _PROFILE_DESCRIPTIONS.get(profile, ""),
+            })
+
+        return {
+            "candidate_skills":      recognised,
+            "recommended_profiles":  recommended,
+        }
+
+    # ─────────────────────────────────────────────────────────────
     # MASTER ENDPOINT
     # ─────────────────────────────────────────────────────────────
 
     def get_insights(self, candidate_skills: list[str]) -> dict:
         """
-        One-shot analysis combining all three services.
+        One-shot analysis combining all four services.
 
         Returns
         -------
-        dict with keys: "upskilling", "skill_importance", "profile_vector"
+        dict with keys:
+          "profile_recommendation" – best matching job profiles (Service 4)
+          "upskilling"             – skills to learn next           (Service 3)
+          "skill_importance"       – most discriminating skills     (Service 1)
+          "profile_vector"         – raw latent vector (for MongoDB storage)
         """
         return {
-            "upskilling":       self.upskilling(candidate_skills),
-            "skill_importance": self.skill_importance(),
-            "profile_vector":   self._encode_candidate(candidate_skills).tolist(),
+            "profile_recommendation": self.profile_recommendation(candidate_skills),
+            "upskilling":             self.upskilling(candidate_skills),
+            "skill_importance":       self.skill_importance(),
+            "profile_vector":         self._encode_candidate(candidate_skills).tolist(),
         }
 
 
